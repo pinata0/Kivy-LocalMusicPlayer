@@ -2,170 +2,166 @@ import os
 import pandas as pd
 import numpy as np
 import librosa
-from datetime import datetime
+from collections import defaultdict
 from transformers import pipeline
 import torch
+from scipy.sparse.csgraph import minimum_spanning_tree
+from typing import List
 
-def main(songs_path, lyrics_path, user_state_params, weights):
-    """
-    Process songs and lyrics, calculate recommendations, and return a list of recommended song names.
-    
-    Args:
-        songs_path (str): Path to the songs directory.
-        lyrics_path (str): Path to the lyrics directory.
-        user_state_params (dict): User state parameters (emotion, activity, time_of_day, weather).
-        weights (np.ndarray): Weights for recommendation calculation.
-    
-    Returns:
-        list: List of recommended song names.
-    """
-    def extract_tempo(filepath):
-        try:
-            y, sr = librosa.load(filepath)
-            tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-            return tempo
-        except Exception as e:
-            print(f"Error processing {filepath}: {e}")
-            return 0
 
-    def extract_key(filepath):
-        try:
-            y, sr = librosa.load(filepath)
-            chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
-            pitch_class = np.argmax(np.sum(chroma, axis=1))
-            pitch_to_key = {
-                0: "C", 1: "C#", 2: "D", 3: "D#", 4: "E", 5: "F",
-                6: "F#", 7: "G", 8: "G#", 9: "A", 10: "A#", 11: "B"
-            }
-            return pitch_to_key[pitch_class]
-        except Exception as e:
-            print(f"Error processing {filepath}: {e}")
-            return "Unknown"
+def algorithm(songs_path, lyrics_path,
+            singers=[1, 2, 3, 2, 3, 3, 1, 2, 3, 3, 4, 4, 1, 4, 4],
+            user_state_params={'emotion': 0.9, 'activity': 1.0, 'time_of_day': 0.7, 'weather': 0.3},
+            weights=np.array([1.0, 1.0, 1.0, 1.0])):
 
-    def extract_energy(filepath):
-        try:
-            y, sr = librosa.load(filepath)
-            rms = librosa.feature.rms(y=y)
-            rms_mean = float(np.mean(rms))
-            return {'RMS': rms_mean}
-        except Exception as e:
-            print(f"Error processing {filepath}: {e}")
-            return {'RMS': 0.0}
+    os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
-    def analyze_sentiment(lyrics):
-        try:
-            device = 0 if torch.cuda.is_available() else -1
-            sentiment_pipeline = pipeline("sentiment-analysis", model="beomi/kcbert-base", framework="pt", device=device)
-            truncated_lyrics = lyrics[:300]
-            result = sentiment_pipeline(truncated_lyrics)[0]
-            return 1.0 if result['label'] == 'POSITIVE' else -1.0
-        except Exception as e:
-            print(f"Sentiment analysis error: {e}")
-            return 0.0
+    class Query:
+        def __init__(self, t: int, p: int, s: int):
+            self.t = t
+            self.p = p
+            self.s = s
 
-    def process_songs_and_lyrics(songs_path, lyrics_path):
+        def __lt__(self, other):
+            return self.t < other.t
+
+    def dfs(cur: int, adj: List[List[int]], visited: List[bool], in_time: List[int], out_time: List[int], sz: List[int], cnt: List[int]) -> int:
+        visited[cur] = True
+        cnt[0] += 1
+        in_time[cur] = cnt[0]
+        sz[cur] = 1
+        for nxt in adj[cur]:
+            if not visited[nxt]:
+                sz[cur] += dfs(nxt, adj, visited, in_time, out_time, sz, cnt)
+        out_time[cur] = cnt[0]
+        return sz[cur]
+
+    def extract_features(songs_path, lyrics_path):
         songs_data = []
         for song_file in os.listdir(songs_path):
             if song_file.endswith('.mp3'):
                 song_name = os.path.splitext(song_file)[0]
                 song_file_path = os.path.join(songs_path, song_file)
-                tempo = extract_tempo(song_file_path)
-                key = extract_key(song_file_path)
-                energy = extract_energy(song_file_path).get('RMS', 0.5)
+                try:
+                    y, sr = librosa.load(song_file_path)
+                    tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+                    chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
+                    key = np.argmax(np.sum(chroma, axis=1))
+                    rms = librosa.feature.rms(y=y).mean()
+                except Exception as e:
+                    print(f"Error processing {song_file}: {e}")
+                    tempo, key, rms = 0, 0, 0.5
+
                 lyrics_file_path = os.path.join(lyrics_path, song_name + '.txt')
-                sentiment = analyze_sentiment(open(lyrics_file_path).read()) if os.path.exists(lyrics_file_path) else 0
+                try:
+                    lyrics = open(lyrics_file_path).read()
+                    device = 0 if torch.cuda.is_available() else -1
+                    sentiment_pipeline = pipeline("sentiment-analysis", model="beomi/kcbert-base", framework="pt",
+                                                  device=device)
+                    sentiment = sentiment_pipeline(lyrics[:300])[0]
+                    sentiment_score = 1.0 if sentiment['label'] == 'POSITIVE' else -1.0
+                except Exception as e:
+                    print(f"Error processing lyrics for {song_file}: {e}")
+                    sentiment_score = 0.0
+
                 songs_data.append({
                     'Song': song_name,
                     'Tempo': tempo,
                     'Key': key,
-                    'Energy': energy,
-                    'Sentiment': sentiment
+                    'Energy': rms,
+                    'Sentiment': sentiment_score
                 })
 
         songs_df = pd.DataFrame(songs_data)
-        songs_df['Tempo'] = pd.to_numeric(songs_df['Tempo'], errors='coerce').fillna(0.0)
-        songs_df['Key'] = pd.to_numeric(songs_df['Key'], errors='coerce').fillna(0.0)
-        songs_df['Energy'] = pd.to_numeric(songs_df['Energy'], errors='coerce').fillna(0.0)
-        songs_df['Sentiment'] = pd.to_numeric(songs_df['Sentiment'], errors='coerce').fillna(0.0)
         return songs_df
 
-    def calculate_distance(song_features, user_features, weights):
-        song_features = np.array(song_features, dtype=np.float64)
-        user_features = np.array(user_features, dtype=np.float64)
-        weights = np.array(weights, dtype=np.float64)
-        return np.sqrt(np.sum(weights * (song_features - user_features) ** 2))
+    def calculate_similarity_matrix(songs_df, user_state_params):
 
-    def recommend_songs(songs_df, user_state, weights):
-        recommendations = []
-        for _, row in songs_df.iterrows():
-            try:
-                song_features = np.array([row['Tempo'], row['Key'], row['Energy'], row['Sentiment']], dtype=np.float64)
-                dist = calculate_distance(song_features, user_state.features, weights)
-                recommendations.append((row['Song'], dist))
-            except Exception as e:
-                print(f"Error processing row: {row}. Error: {e}")
-        recommendations = sorted(recommendations, key=lambda x: x[1])
-        return [rec[0] for rec in recommendations]  # Return only song names
+        num_songs = len(songs_df)
+        distance_matrix = np.zeros((num_songs, num_songs))
 
-    class UserState:
-        def __init__(self, emotion, activity, time_of_day, weather):
-            self.features = np.array([emotion, activity, time_of_day, weather])
+        # 사용자 상태에 따른 가중치 정의
+        weight_tempo = user_state_params['activity']  # 활동량에 따라 템포 가중치
+        weight_key = user_state_params['time_of_day']  # 시간대에 따른 키 가중치
+        weight_energy = user_state_params['weather']  # 날씨에 따른 에너지 가중치
+        weight_sentiment = user_state_params['emotion']  # 감정에 따른 감성 가중치
 
-    # Create user state
-    user_state = UserState(**user_state_params)
+        # 특성별 가중치 배열 생성
+        feature_weights = np.array([weight_tempo, weight_key, weight_energy, weight_sentiment])
 
-    # Process songs and lyrics
-    songs_dataset = process_songs_and_lyrics(songs_path, lyrics_path)
+        for i in range(num_songs):
+            for j in range(i + 1, num_songs):
+                feature1 = songs_df.iloc[i][['Tempo', 'Key', 'Energy', 'Sentiment']].values
+                feature2 = songs_df.iloc[j][['Tempo', 'Key', 'Energy', 'Sentiment']].values
+                # 각 특성의 차이를 가중치와 함께 반영
+                weighted_difference = feature_weights * (feature1 - feature2)
+                distance = np.linalg.norm(weighted_difference)  # 유클리드 거리 계산
+                distance_matrix[i, j] = distance
+                distance_matrix[j, i] = distance
 
-    # Get recommended songs
-    return recommend_songs(songs_dataset, user_state, weights)
+        return distance_matrix
 
+    def generate_edges_from_similarity(distance_matrix):
+        mst = minimum_spanning_tree(distance_matrix).toarray().astype(float)
+        edges = []
+        for i in range(len(mst)):
+            for j in range(i + 1, len(mst)):
+                if mst[i, j] > 0:
+                    edges.append((i + 1, j + 1))
+        return edges
 
-    # 좋아요 버튼 안 만듬
-    # def update_weights(weights, feedback, song_features, user_features, learning_rate=0.1):
-    #     """조아용 기준 가중치"""
-    #     if feedback == "like":
-    #         weights -= learning_rate * np.abs(song_features - user_features)
-    #     elif feedback == "dislike":
-    #         weights += learning_rate * np.abs(song_features - user_features)
-    #     return np.clip(weights, 0.1, 1)  # 가중치 제한 (0.1 ~ 1)
+    def update(tree: List[int], x: int, v: int, n: int):
+        while x <= n:
+            tree[x] += v
+            x += x & -x
 
-def algorithm(songs_path, lyrics_path):
+    def range_update(tree: List[int], l: int, r: int, v: int, n: int):
+        update(tree, l, v, n)
+        update(tree, r + 1, -v, n)
 
-    # Get the current time
-    now = datetime.now()
+    # 곡 데이터 추출
+    songs_df = extract_features(songs_path, lyrics_path)
+    if songs_df.empty:
+        raise ValueError("The songs dataframe is empty. Check the song data extraction.")
 
-    # Calculate the total minutes in a day
-    total_minutes_in_a_day = 24 * 60  # 1440 minutes
+    # edges 생성
+    distance_matrix = calculate_similarity_matrix(songs_df, user_state_params)
+    edges = generate_edges_from_similarity(distance_matrix)
 
-    # Calculate the current minutes since midnight
-    current_minutes = now.hour * 60 + now.minute
+    # 곡 추천 알고리즘
+    n = len(songs_df)
+    adj = [[] for _ in range(n + 1)]
+    for u, v in edges:
+        adj[u].append(v)
+        adj[v].append(u)
 
-    # Normalize to a range of 0 to 1
-    normalized_time_of_day = current_minutes / total_minutes_in_a_day
+    in_time = [0] * (n + 1)
+    out_time = [0] * (n + 1)
+    sz = [0] * (n + 1)
+    visited = [False] * (n + 1)
+    cnt = [0]
 
+    dfs(1, adj, visited, in_time, out_time, sz, cnt)
 
-    # User state parameters
-    user_state_params = {
-        'emotion': 0.9,     # 감정 (기쁨)
-        'activity': 1.0,    # 활동 (운동)
-        'time_of_day': round(normalized_time_of_day, 1), # 저녁
-        'weather': 0.3      # 날씨 (흐림)
-    }
+    nums = [0] * (n + 1)
+    for i in range(1, n + 1):
+        nums[singers[i - 1]] += 1
 
-    # Weights for features
-    weights = np.array([1.0, 1.0, 1.0, 1.0])
+    tree = [0] * (n + 1)
+    for i in range(1, n + 1):
+        range_update(tree, in_time[i], out_time[i], weights[i % len(weights)], n)
 
-    # Call the algorithm
-    recommended_songs = main(songs_path, lyrics_path, user_state_params, weights)
-
-    recommended_songs = [name + '.mp3' for name in recommended_songs]
-    # Print recommended songs
-    print(recommended_songs)
+    recommended_songs = [songs_df['Song'][i - 1] + '.mp3' for i in range(1, n + 1)]
     return recommended_songs
 
-if __name__ == '__main__':
-    songs_path = './data/songs'  # Update with your songs directory
-    lyrics_path = './data/lyrics'  # Update with your lyrics directory
+if __name__ == "__main__":
+        
+    # 사용 예시
+    songs_path = './data/songs'
+    lyrics_path = './data/lyrics'
+    singers = [1, 2, 3, 2, 3, 3, 1, 2, 3, 3, 4, 4, 1, 4, 4]
+    user_state_params = {'emotion': 0.9, 'activity': 1.0, 'time_of_day': 0.7, 'weather': 0.3}
+    weights = np.array([1.0, 1.0, 1.0, 1.0])
 
-    algorithm(songs_path, lyrics_path)
+    recommended_songs = algorithm(songs_path, lyrics_path, singers, user_state_params, weights)
+    print(f"Recommended Songs: {recommended_songs}")
